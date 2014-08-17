@@ -14,7 +14,8 @@ object MyModule {
   }
 
   def main(args: Array[String]): Unit =
-    println(formatAbs(-42))
+    println(formatResult("absolute value", -42, abs))
+    println(formatResult("factorial", 7, factorial))
 
   // A definition of factorial, using a local, tail recursive function
   def factorial(n: Int): Int = {
