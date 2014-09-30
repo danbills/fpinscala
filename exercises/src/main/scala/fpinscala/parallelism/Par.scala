@@ -1,6 +1,61 @@
 package fpinscala.parallelism
 
 import java.util.concurrent._
+import java.util.concurrent.atomic.AtomicReference
+
+object Par2 {
+
+  sealed trait Future[A] {
+    private[parallelism] def apply(k: A => Unit): Unit
+  }
+
+  type Par[+A] = ExecutorService => Future[A]
+
+  def run[A](es: ExecutorService)(p: Par[A]): A = {
+    val ref = new AtomicReference[A]
+    val latch = new CountDownLatch(1)
+    p(es) { a => ref.set(a); latch.countDown }
+    latch.await
+    ref.get
+  }
+
+  def unit[A](a: A): Par[A] =
+    es => new Future[A] {
+      def apply(cb: A => Unit): Unit = cb(a)
+    }
+
+  def eval(es: ExecutorService)(r: => Unit): Unit =
+    es.submit(new Callable[Unit] { def call = r })
+
+  def fork[A](a: => Par[A]): Par[A] =
+    es => new Future[A] {
+      def apply(cb: A => Unit): Unit = eval(es)(a(es)(cb))
+    }
+
+  def map2[A,B,C](p: Par[A], p2: Par[B])(f: (A, B) => C): Par[C] =
+    es => new Future[C] {
+      def apply(cb: C => Unit): Unit = {
+        var ar: Option[A] = None
+        var br: Option[B] = None
+
+        val combiner = Actor[Either[A,B]](es) {
+
+          case Left(a) => br match {
+            case None => ar = Some(a)
+            case Some(b) => eval(es)(cb(f(a, b)))
+          }
+
+          case Right(b) => ar match {
+            case None => br = Some(b)
+            case Some(a) => eval(es)(cb(f(a, b)))
+          }
+        }
+
+        p(es)(a => combiner ! Left(a))
+        p2(es)(b => combiner ! Right(b))
+      }
+    }
+}
 
 object Par {
   type Par[A] = ExecutorService => Future[A]
@@ -8,7 +63,22 @@ object Par {
   def run[A](s: ExecutorService)(a: Par[A]): Future[A] = a(s)
 
   def unit[A](a: A): Par[A] = (es: ExecutorService) => UnitFuture(a) // `unit` is represented as a function that returns a `UnitFuture`, which is a simple implementation of `Future` that just wraps a constant value. It doesn't use the `ExecutorService` at all. It's always done and can't be cancelled. Its `get` method simply returns the value that we gave it.
-  
+
+  def asyncF[A,B](f: A => B): A => Par[B] = a => fork(unit(f(a)))
+
+  def sequence[A](l: List[Par[A]]): Par[List[A]] =
+    l.foldRight[Par[List[A]]](unit(List[A]()))((h, t) => map2(h, t)(_ :: _))
+
+  def parMap[A,B](l: List[A])(f: A => B): Par[List[B]] = fork {
+    val fbs: List[Par[B]] = l.map(asyncF(f))
+    sequence(fbs)
+  }
+
+  def parFilter[A](l: List[A])(f: A => Boolean): Par[List[A]] = fork {
+    val fas = l.map(asyncF((x) => if (f(x)) List(x) else List()))
+    map(sequence(fas))(_.flatten)
+  }
+
   private case class UnitFuture[A](get: A) extends Future[A] {
     def isDone = true 
     def get(timeout: Long, units: TimeUnit) = get 
@@ -24,11 +94,13 @@ object Par {
     }
   
   def fork[A](a: => Par[A]): Par[A] = // This is the simplest and most natural implementation of `fork`, but there are some problems with it--for one, the outer `Callable` will block waiting for the "inner" task to complete. Since this blocking occupies a thread in our thread pool, or whatever resource backs the `ExecutorService`, this implies that we're losing out on some potential parallelism. Essentially, we're using two threads when one should suffice. This is a symptom of a more serious problem with the implementation, and we will discuss this later in the chapter.
-    es => es.submit(new Callable[A] { 
+    es => es.submit(new Callable[A] {
       def call = a(es).get
     })
 
-  def map[A,B](pa: Par[A])(f: A => B): Par[B] = 
+  def delay[A](fa: => Par[A]): Par[A] = es => fa(es)
+
+  def map[A,B](pa: Par[A])(f: A => B): Par[B] =
     map2(pa, unit(()))((a,_) => f(a))
 
   def sortPar(parList: Par[List[Int]]) = map(parList)(_.sorted)
